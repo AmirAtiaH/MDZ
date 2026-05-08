@@ -1,0 +1,27 @@
+# Odin build output
+*.exe
+*.dll
+*.so
+*.dylib
+*.obj
+*.lib
+*.pdb
+
+# Node.js (keep package.json for benchmark deps)
+node_modules/
+
+# Rust build
+rust/target/
+
+# Benchmark output
+benchmark/mdz_results.txt
+benchmark/mdx_results.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
