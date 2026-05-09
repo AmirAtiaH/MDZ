@@ -10,5 +10,5 @@ case "$(uname -s)" in
 esac
 
 echo "==> Building mdz shared library..."
-$ODIN build ffi -build:shared -o:speed -no-bounds-check -disable-assert
+$ODIN build ffi -build-mode:shared -o:aggressive -no-bounds-check -disable-assert
 echo "Done: $LIB"

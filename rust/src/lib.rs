@@ -80,7 +80,7 @@ mod tests {
 
     #[test]
     fn test_compile_file() {
-        let result = compile_file("../test.mdx").unwrap();
+        let result = compile_file("../regression.mdx").unwrap();
         assert!(result.contains("MDXContent"));
     }
 }

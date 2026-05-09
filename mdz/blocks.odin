@@ -1,5 +1,7 @@
 package mdz
 
+import "core:strings"
+
 // ─── Block-level markdown → JSX ──────────────────────────────────────────────
 //
 // Each process_* function reads one block from the input at the given position,
@@ -148,15 +150,15 @@ process_paragraph :: proc(input: string, pos: ^int, w: ^Writer) {
 // ─── Blockquote ────────────────────────────────────────────────────────────
 
 process_blockquote :: proc(input: string, pos: ^int, w: ^Writer) {
-    start := pos^
+    i := pos^
 
-    // Collect all lines that are part of this blockquote
-    // Each line starts with >
-    i := start
-    writer_write(w, "\n<blockquote>\n")
+    // Collect all blockquote content (strip > prefixes)
+    content_buf: Writer
+    writer_init(&content_buf, len(input) / 4)
+    defer writer_destroy(&content_buf)
+    last_blank := true
 
     for i < len(input) {
-        // Skip whitespace
         j := i
         for j < len(input) && (input[j] == ' ' || input[j] == '\t') {
             j += 1
@@ -167,7 +169,7 @@ process_blockquote :: proc(input: string, pos: ^int, w: ^Writer) {
         j += 1 // skip >
 
         // Skip optional space after >
-        if j < len(input) && input[j] == ' ' {
+        if j < len(input) && (input[j] == ' ') {
             j += 1
         }
 
@@ -177,19 +179,27 @@ process_blockquote :: proc(input: string, pos: ^int, w: ^Writer) {
             line_end += 1
         }
 
-        // Emit content
-        writer_write(w, "<p>")
-        convert_inline(input[j:line_end], w)
-        writer_write(w, "</p>\n")
+        // Handle nested blockquote (> >)
+        content_start := j
+        if content_start < len(input) && input[content_start] == '>' {
+            // Preserve nested marker for recursive handling
+            writer_write(&content_buf, "> ")
+            content_start += 1
+            if content_start < line_end && input[content_start] == ' ' {
+                content_start += 1
+            }
+        }
 
-        // Advance past newline
+        writer_write(&content_buf, input[content_start:line_end])
+        writer_write(&content_buf, "\n")
+        last_blank = false
+
         if line_end < len(input) && input[line_end] == '\n' {
             i = line_end + 1
         } else {
             i = line_end
         }
 
-        // Check if next line is also a blockquote
         if i >= len(input) {
             break
         }
@@ -202,128 +212,314 @@ process_blockquote :: proc(input: string, pos: ^int, w: ^Writer) {
         }
     }
 
+    // Now process the collected content as markdown blocks
+    block_content := writer_get(&content_buf)
+    writer_write(w, "\n<blockquote>\n")
+
+    bpos := 0
+    for bpos < len(block_content) {
+        bpos = skip_blank_lines(block_content, bpos)
+        if bpos >= len(block_content) {
+            break
+        }
+
+        bt := classify_block(block_content, bpos)
+
+        #partial switch bt {
+        case .Fence:
+            process_fence(block_content, &bpos, w)
+        case .Heading:
+            process_heading(block_content, &bpos, w)
+        case .Blockquote:
+            process_blockquote(block_content, &bpos, w)
+        case .List:
+            process_list(block_content, &bpos, w)
+        case .ThematicBreak:
+            process_thematic_break(block_content, &bpos, w)
+        case .Paragraph:
+            process_paragraph(block_content, &bpos, w)
+        case .BlankLine:
+            bpos += 1
+        case:
+            process_paragraph(block_content, &bpos, w)
+        }
+    }
+
     writer_write(w, "</blockquote>\n")
     pos^ = i
 }
 
 // ─── List (ordered and unordered) ─────────────────────────────────────────-
 
+ListStackEntry :: struct {
+    is_ordered: bool,
+    indent:     int,
+}
+
 process_list :: proc(input: string, pos: ^int, w: ^Writer) {
-    start := pos^
+    i := pos^
 
-    // Determine if ordered or unordered
-    i := start
-    for i < len(input) && (input[i] == ' ' || input[i] == '\t') {
-        i += 1
-    }
-    ch := input[i]
-    is_ordered := is_digit(ch)
+    stack: [dynamic]ListStackEntry
+    defer delete(stack)
 
-    if is_ordered {
-        writer_write(w, "\n<ol>\n")
-    } else {
-        writer_write(w, "\n<ul>\n")
-    }
-
-    for i < len(input) {
-        // Skip whitespace
-        j := i
-        for j < len(input) && (input[j] == ' ' || input[j] == '\t') {
-            j += 1
+    indent_to_spaces :: proc(s: string, start: int) -> int {
+        n := 0
+        for idx := start; idx < len(s); idx += 1 {
+            if s[idx] == ' ' {
+                n += 1
+            } else if s[idx] == '\t' {
+                n += 4
+            } else {
+                return n
+            }
         }
-        if j >= len(input) {
-            break
-        }
+        return n
+    }
 
-        // Check for ordered or unordered marker
-        is_item_ordered := false
-        if is_digit(input[j]) {
-            k := j
-            for k < len(input) && is_digit(input[k]) {
+    parse_marker :: proc(s: string, pos: int) -> (content_start: int, is_ordered: bool, ok: bool) {
+        if pos >= len(s) {
+            return 0, false, false
+        }
+        ch := s[pos]
+        if is_digit(ch) {
+            k := pos
+            for k < len(s) && is_digit(s[k]) {
                 k += 1
             }
-            if k >= len(input) || (input[k] != '.' && input[k] != ')') {
-                break
+            if k < len(s) && (s[k] == '.' || s[k] == ')') && k + 1 < len(s) && s[k + 1] == ' ' {
+                return k + 2, true, true
             }
-            if k + 1 >= len(input) || input[k + 1] != ' ' {
-                break
-            }
-            j = k + 2
-            is_item_ordered = true
-        } else if (input[j] == '-' || input[j] == '*') && j + 1 < len(input) && input[j + 1] == ' ' {
-            j += 2
-        } else {
+            return 0, false, false
+        }
+        if (ch == '-' || ch == '*') && pos + 1 < len(s) && s[pos + 1] == ' ' {
+            return pos + 2, false, true
+        }
+        return 0, false, false
+    }
+
+    // First pass: collect all list items with their indent and content.
+    // Continuation lines are absorbed into the item content.
+    // Blank lines between items trigger loose list rendering.
+    Item :: struct {
+        indent:       int,
+        is_ordered:   bool,
+        content:      string,
+        task_checked: int,  // -1 = not a task item, 0 = unchecked [ ], 1 = checked [x]
+    }
+    items := make([dynamic]Item)
+    defer delete(items)
+    is_loose := false
+
+    for i < len(input) {
+        indent := indent_to_spaces(input, i)
+        j := i + indent
+
+        content_start, is_ord, ok := parse_marker(input, j)
+        if !ok {
             break
         }
 
-        // If list type changed, close current and open new
-        if is_item_ordered != is_ordered {
-            if is_item_ordered {
-                // was unordered -> ordered
-                writer_write(w, "</ul>\n<ol>\n")
-            } else {
-                // was ordered -> unordered
-                writer_write(w, "</ol>\n<ul>\n")
-            }
-            is_ordered = is_item_ordered
-        }
-
-        // Read the rest of the line
-        line_end := j
+        // Read first line of content after the marker
+        line_end := content_start
         for line_end < len(input) && input[line_end] != '\n' {
             line_end += 1
         }
 
-        // Emit list item
-        writer_write(w, "<li>")
-        convert_inline(input[j:line_end], w)
-        writer_write(w, "</li>\n")
-
-        // Advance past newline
-        if line_end < len(input) && input[line_end] == '\n' {
-            i = line_end + 1
-        } else {
-            i = line_end
+        // Check for GFM task list: [ ] or [x] after the marker
+        task_checked := -1
+        when TaskList {
+            if content_start + 3 < len(input) && input[content_start] == '[' && input[content_start + 2] == ']' && input[content_start + 3] == ' ' {
+                if input[content_start + 1] == ' ' {
+                    task_checked = 0
+                } else if input[content_start + 1] == 'x' || input[content_start + 1] == 'X' {
+                    task_checked = 1
+                }
+                if task_checked >= 0 {
+                    content_start += 4
+                    line_end = content_start
+                    for line_end < len(input) && input[line_end] != '\n' {
+                        line_end += 1
+                    }
+                }
+            }
         }
 
-        // Check if next line is also a list item
-        if i >= len(input) {
-            break
-        }
-        // Skip whitespace-only lines (loose list items)
-        next := i
-        for next < len(input) && (input[next] == ' ' || input[next] == '\t' || input[next] == '\n') {
+        // Build item content (first line, plus continuation lines)
+        content_buf := strings.builder_make_len_cap(0, (line_end - content_start) + 64, context.temp_allocator)
+        strings.write_string(&content_buf, input[content_start:line_end])
+
+        // The content indent is the column (relative to line start) where item content begins
+        content_indent := content_start - i
+
+        // Advance past the first line's newline
+        next := line_end
+        if next < len(input) && input[next] == '\n' {
             next += 1
         }
-        if next >= len(input) {
-            break
-        }
-        nc := input[next]
-        if is_digit(nc) {
-            if !is_ordered_list_start(input, next) {
+
+        // Look ahead: absorb continuation lines, detect blank lines between items
+        for next < len(input) {
+            line_start2 := next
+            line_end2 := next
+            for line_end2 < len(input) && input[line_end2] != '\n' {
+                line_end2 += 1
+            }
+            whole_line := input[line_start2:line_end2]
+
+            // Blank line? (also handles \r\n Windows line endings)
+            trimmed := whole_line
+            for len(trimmed) > 0 && (trimmed[0] == ' ' || trimmed[0] == '\t' || trimmed[0] == '\r') {
+                trimmed = trimmed[1:]
+            }
+            if len(trimmed) == 0 {
+                is_loose = true
+                next = line_end2
+                if next < len(input) && input[next] == '\n' {
+                    next += 1
+                }
+                continue
+            }
+
+            // Non-blank line — check if it's a new list marker
+            next_indent := indent_to_spaces(input, line_start2)
+            marker_pos := line_start2 + next_indent
+            _, _, is_marker := parse_marker(input, marker_pos)
+            if is_marker {
                 break
             }
-        } else if (nc == '-' || nc == '*') && next + 1 < len(input) && input[next + 1] == ' ' {
-            // continue list
-        } else {
+
+            // Continuation line? Must be indented at least as much as the content column
+            if next_indent >= content_indent {
+                strings.write_byte(&content_buf, ' ')
+                strings.write_string(&content_buf, input[line_start2 + content_indent:line_end2])
+                next = line_end2
+                if next < len(input) && input[next] == '\n' {
+                    next += 1
+                }
+                continue
+            }
+
+            // Not a marker, not a continuation — list is done
             break
         }
-    }
 
-    // Note: when the list type tracks correctly, we close whatever we're in.
-    // Since calling code dispatches on the *first* list marker of the block,
-    // we emit the closing tag(s) for whatever list we're currently tracking.
-    // We may need to close multiple lists if the type changes, but in our
-    // model we handle this by detecting type changes and closing/reopening
-    // within the loop. Here at the end, is_ordered reflects the most recent
-    // list type, so a single close is correct.
-    if is_ordered {
-        writer_write(w, "</ol>\n")
-    } else {
-        writer_write(w, "</ul>\n")
+        append(&items, Item{
+            indent       = indent,
+            is_ordered   = is_ord,
+            content      = strings.to_string(content_buf),
+            task_checked = task_checked,
+        })
+
+        // Advance to next position (either next item's marker or end-of-list content)
+        i = next
     }
 
     pos^ = i
+
+    if len(items) == 0 {
+        return
+    }
+
+    // Second pass: emit HTML using indent stack
+    close_li := false
+
+    close_list :: proc(w: ^Writer, ordered: bool) {
+        if ordered {
+            writer_write(w, "</ol>\n")
+        } else {
+            writer_write(w, "</ul>\n")
+        }
+    }
+
+    open_list :: proc(w: ^Writer, ordered: bool) {
+        if ordered {
+            writer_write(w, "\n<ol>\n")
+        } else {
+            writer_write(w, "\n<ul>\n")
+        }
+    }
+
+    for idx in 0 ..< len(items) {
+        item := items[idx]
+        indent := item.indent
+        is_ord := item.is_ordered
+
+        // Pop stack while current indent < top indent (going up; = means same level sibling)
+        nested_closed := false
+        for len(stack) > 0 && indent < stack[len(stack) - 1].indent {
+            if close_li {
+                writer_write(w, "</li>\n")
+                close_li = false
+            }
+            close_list(w, stack[len(stack) - 1].is_ordered)
+            pop(&stack)
+            nested_closed = true
+        }
+        // If we came back up from a nested list, close the parent <li>
+        // that was left open to contain the nested content.
+        if nested_closed {
+            close_li = true
+        }
+
+        // Check for sibling at same indent but different type (ordered → unordered)
+        if len(stack) > 0 && indent == stack[len(stack) - 1].indent && is_ord != stack[len(stack) - 1].is_ordered {
+            if close_li {
+                writer_write(w, "</li>\n")
+                close_li = false
+            }
+            close_list(w, stack[len(stack) - 1].is_ordered)
+            pop(&stack)
+        }
+
+        // Open new list if needed
+        if len(stack) == 0 || indent > stack[len(stack) - 1].indent {
+            open_list(w, is_ord)
+            append(&stack, ListStackEntry{is_ordered = is_ord, indent = indent})
+        }
+
+        // Close previous sibling <li>
+        if close_li {
+            writer_write(w, "</li>\n")
+            close_li = false
+        }
+
+        // Emit <li>
+        if item.task_checked >= 0 {
+            writer_write(w, "<li class=\"task-item\">\n<input type=\"checkbox\" disabled")
+            if item.task_checked == 1 {
+                writer_write(w, " checked")
+            }
+            writer_write(w, "/> ")
+        } else {
+            writer_write(w, "<li>")
+        }
+
+        // Loose list: wrap content in <p> tags
+        if is_loose && len(item.content) > 0 {
+            writer_write(w, "\n<p>")
+            convert_inline(item.content, w)
+            writer_write(w, "</p>\n")
+        } else {
+            convert_inline(item.content, w)
+        }
+
+        // Check if next item is nested (deeper indent) — if so, don't close </li>
+        if idx + 1 < len(items) && items[idx + 1].indent > indent {
+            // Leave <li> open — the nested list goes inside it
+            close_li = false
+        } else {
+            close_li = true
+        }
+    }
+
+    // Close remaining
+    if close_li {
+        writer_write(w, "</li>\n")
+    }
+    for len(stack) > 0 {
+        close_list(w, stack[len(stack) - 1].is_ordered)
+        pop(&stack)
+    }
 }
 
 // ─── Code fence ────────────────────────────────────────────────────────────
@@ -386,13 +582,23 @@ process_fence :: proc(input: string, pos: ^int, w: ^Writer) {
 
     // Emit <pre><code>
     writer_write(w, "\n<pre><code")
-    if lang != "" {
-        writer_write(w, " class=\"language-")
-        write_escaped(lang, w)
-        writer_write(w, "\"")
+    when Highlight {
+        if lang != "" {
+            writer_write(w, " class=\"language-")
+            write_escaped(lang, w)
+            writer_write(w, "\"")
+        }
     }
     writer_write(w, ">")
-    write_escaped(content, w)
+    when Highlight {
+        if lang != "" {
+            highlight_write(content, lang, w)
+        } else {
+            write_escaped(content, w)
+        }
+    } else {
+        write_escaped(content, w)
+    }
     writer_write(w, "</code></pre>\n")
 
     // Advance past closing fence
@@ -561,7 +767,7 @@ split_table_cells :: proc(line: string) -> []string {
 
     count := 1
     for i in 0 ..< len(s) {
-        if s[i] == '|' {
+        if s[i] == '|' && (i == 0 || s[i - 1] != '\\') {
             count += 1
         }
     }
@@ -571,7 +777,7 @@ split_table_cells :: proc(line: string) -> []string {
     cell_start := 0
     pos := 0
     for pos < len(s) {
-        if s[pos] == '|' {
+        if s[pos] == '|' && (pos == 0 || s[pos - 1] != '\\') {
             result[cell_idx] = s[cell_start:pos]
             cell_idx += 1
             pos += 1
@@ -623,6 +829,110 @@ process_js_block :: proc(input: string, pos: ^int, w: ^Writer) {
         }
     }
     pos^ = end
+}
+
+// ─── Definition list (term : definition) ────────────────────────────────
+
+process_definition_list :: proc(input: string, pos: ^int, w: ^Writer) {
+    i := pos^
+
+    // Read term (current line)
+    term_start := i
+    term_end := i
+    for term_end < len(input) && input[term_end] != '\n' { term_end += 1 }
+    term := input[term_start:term_end]
+    if term_end < len(input) && input[term_end] == '\n' {
+        i = term_end + 1
+    } else {
+        i = term_end
+    }
+
+    // Skip blank lines
+    for i < len(input) {
+        ch := input[i]
+        if ch == ' ' || ch == '\t' || ch == '\n' { i += 1 } else { break }
+    }
+
+    // Collect definitions
+    defs := make([dynamic]string)
+    defer delete(defs)
+
+    for i < len(input) {
+        // Skip leading whitespace
+        j := i
+        for j < len(input) && (input[j] == ' ' || input[j] == '\t') { j += 1 }
+        if j >= len(input) || input[j] != ':' { break }
+        k := j + 1
+        for k < len(input) && (input[k] == ' ' || input[k] == '\t') { k += 1 }
+        // Read definition content
+        line_end := k
+        for line_end < len(input) && input[line_end] != '\n' { line_end += 1 }
+        append(&defs, input[k:line_end])
+        if line_end < len(input) && input[line_end] == '\n' {
+            i = line_end + 1
+        } else {
+            i = line_end
+        }
+        // Check next non-blank line
+        next := i
+        for next < len(input) && (input[next] == ' ' || input[next] == '\t' || input[next] == '\n') { next += 1 }
+        if next >= len(input) || input[next] != ':' { break }
+    }
+
+    if len(defs) > 0 {
+        writer_write(w, "\n<dl>\n<dt>")
+        convert_inline(trim_space(term), w)
+        writer_write(w, "</dt>\n")
+        for def in defs {
+            writer_write(w, "<dd>")
+            convert_inline(trim_space(def), w)
+            writer_write(w, "</dd>\n")
+        }
+        writer_write(w, "</dl>\n")
+    }
+
+    pos^ = i
+}
+
+// ─── Comment <!-- --> and {/* */} ────────────────────────────────────────
+
+process_comment :: proc(input: string, pos: ^int) {
+    i := pos^
+
+    // HTML comment: <!-- ... -->
+    if i + 3 < len(input) && input[i:i + 4] == "<!--" {
+        i += 4
+        for i + 2 < len(input) {
+            if input[i:i + 3] == "-->" {
+                i += 3
+                if i < len(input) && input[i] == '\n' { i += 1 }
+                pos^ = i
+                return
+            }
+            i += 1
+        }
+        pos^ = len(input)
+        return
+    }
+
+    // JSX comment: {/* ... */}
+    if i + 2 < len(input) && input[i:i + 3] == "{/*" {
+        i += 3
+        for i + 1 < len(input) {
+            if input[i] == '*' && input[i + 1] == '/' {
+                i += 2
+                if i < len(input) && input[i] == '}' { i += 1 }
+                if i < len(input) && input[i] == '\n' { i += 1 }
+                pos^ = i
+                return
+            }
+            i += 1
+        }
+        pos^ = len(input)
+        return
+    }
+
+    pos^ = skip_line(input, pos^)
 }
 
 // ─── Frontmatter ──────────────────────────────────────────────────────────

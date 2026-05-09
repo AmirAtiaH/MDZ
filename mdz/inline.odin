@@ -20,12 +20,12 @@ convert_inline :: proc(text: string, w: ^Writer) {
         // Fast path: batch-copy plain text until next trigger character.
         // Trigger set manually inlined (not a function call) to avoid
         // call/ret overhead — this runs for EVERY character.
-        if ch != '*' && ch != '`' && ch != '[' && ch != '!' && ch != '{' && ch != '<' && ch != '~' && ch != '\\' && ch != '&' {
+        if ch != '*' && ch != '`' && ch != '[' && ch != '!' && ch != '{' && ch != '<' && ch != '~' && ch != '\\' && ch != '&' && ch != '$' && ch != ':' {
             start := i
             i += 1
             for i < len(text) {
                 c := text[i]
-                if c == '*' || c == '`' || c == '[' || c == '!' || c == '{' || c == '<' || c == '~' || c == '\\' || c == '&' {
+                if c == '*' || c == '`' || c == '[' || c == '!' || c == '{' || c == '<' || c == '~' || c == '\\' || c == '&' || c == '$' || c == ':' {
                     break
                 }
                 i += 1
@@ -51,16 +51,30 @@ convert_inline :: proc(text: string, w: ^Writer) {
         case '{':
             i = handle_expression(text, i, w)
         case '<':
-            // Could be inline JSX — try to match a JSX element
-            n := try_jsx_element(text[i:], w)
+            n := 0
+            // 1. Try autolink first — GFM autolinks like <https://example.com>
+            //    must be checked before JSX since they share the <...> syntax.
+            when Autolink {
+                n = try_autolink(text, i, w)
+                if n > 0 {
+                    i += n
+                    break
+                }
+            }
+            // 2. Could be inline JSX — try to match a JSX element
+            n = try_jsx_element(text[i:], w)
             if n > 0 {
                 i += n
             } else {
                 writer_write(w, "&lt;")
                 i += 1
             }
+        case '$':
+            i = handle_math(text, i, w)
         case '~':
             i = handle_tilde(text, i, w)
+        case ':':
+            i = handle_emoji(text, i, w)
         case '\\':
             if i + 1 < len(text) {
                 writer_write_byte(w, text[i + 1])
@@ -70,19 +84,10 @@ convert_inline :: proc(text: string, w: ^Writer) {
                 i += 1
             }
         case '&':
-            if i + 1 < len(text) && text[i + 1] == '#' {
-                // HTML entity — pass through
-                j := i + 2
-                for j < len(text) && text[j] != ';' {
-                    j += 1
-                }
-                if j < len(text) {
-                    writer_write(w, text[i:j + 1])
-                    i = j + 1
-                } else {
-                    writer_write(w, "&amp;")
-                    i += 1
-                }
+            entity, new_i := try_html_entity(text, i)
+            if entity != "" {
+                writer_write(w, entity)
+                i = new_i
             } else {
                 writer_write(w, "&amp;")
                 i += 1
@@ -157,6 +162,71 @@ handle_tilde :: proc(text: string, i: int, w: ^Writer) -> int {
     return i + 1
 }
 
+// ─── Handle $ (math: inline $...$ and display $$...$$) ────────────────────
+
+handle_math :: proc(text: string, i: int, w: ^Writer) -> int {
+    n := len(text)
+
+    // $$...$$ display math
+    if i + 1 < n && text[i + 1] == '$' {
+        end := find_closing(text, i + 2, "$$")
+        if end >= 0 && end - i > 2 {
+            when Math {
+                writer_write(w, "<pre><code class=\"language-math\">")
+                write_escaped(text[i + 2:end], w)
+                writer_write(w, "</code></pre>")
+            } else {
+                writer_write(w, text[i:end + 2])
+            }
+            return end + 2
+        }
+        // No closing $$ — fall through to literal
+        writer_write_byte(w, '$')
+        writer_write_byte(w, '$')
+        return i + 2
+    }
+
+    // $...$ inline math
+    end := find_closing(text, i + 1, "$")
+    if end >= 0 && end - i > 1 {
+        when Math {
+            writer_write(w, "<code class=\"language-math\">")
+            write_escaped(text[i + 1:end], w)
+            writer_write(w, "</code>")
+        } else {
+            writer_write(w, text[i:end + 1])
+        }
+        return end + 1
+    }
+
+    // Not math — literal dollar
+    writer_write_byte(w, '$')
+    return i + 1
+}
+
+// ─── Handle :word: emoji ──────────────────────────────────────────────────
+
+handle_emoji :: proc(text: string, i: int, w: ^Writer) -> int {
+    // Find closing : with only word characters in between
+    j := i + 1
+    for j < len(text) && is_emoji_word_char(text[j]) {
+        j += 1
+    }
+    if j > i + 1 && j < len(text) && text[j] == ':' {
+        when Emoji {
+            writer_write(w, "<span class=\"emoji\">")
+            writer_write(w, text[i + 1:j])
+            writer_write(w, "</span>")
+        } else {
+            writer_write(w, text[i:j + 1])
+        }
+        return j + 1
+    }
+    // Not emoji — literal colon
+    writer_write_byte(w, ':')
+    return i + 1
+}
+
 // ─── Handle `backtick` (inline code) ───────────────────────────────────────
 
 handle_backtick :: proc(text: string, i: int, w: ^Writer) -> int {
@@ -206,6 +276,28 @@ handle_backtick :: proc(text: string, i: int, w: ^Writer) -> int {
 
 handle_link :: proc(text: string, i: int, w: ^Writer) -> int {
     n := len(text)
+
+    // Footnote reference: [^id] — only when not followed by ( or [
+    when Footnote {
+        if i + 1 < n && text[i + 1] == '^' {
+            close_bracket := find_byte(text[i + 2:], ']')
+            if close_bracket >= 0 {
+                after := i + 2 + close_bracket + 1
+                if after >= n || (text[after] != '(' && text[after] != '[') {
+                    id := text[i + 2:i + 2 + close_bracket]
+                    writer_write(w, "<sup><a href=\"#fn:")
+                    write_escaped(id, w)
+                    writer_write(w, "\" id=\"fnref:")
+                    write_escaped(id, w)
+                    writer_write(w, "\">")
+                    write_escaped(id, w)
+                    writer_write(w, "</a></sup>")
+                    return i + 2 + close_bracket + 1
+                }
+            }
+        }
+    }
+
     // Find the closing bracket
     close_bracket := find_byte(text[i + 1:], ']')
     if close_bracket < 0 {
@@ -221,28 +313,26 @@ handle_link :: proc(text: string, i: int, w: ^Writer) -> int {
             link_text := text[i + 1:close_bracket]
             url := text[close_bracket + 2 : close_bracket + 2 + close_paren]
 
-            // Check for title: [text](url "title") or [text](url 'title')
-            url_only := url
-            title: string
-            if len(url) >= 2 {
-                last := url[len(url) - 1]
-                if last == '"' || last == '\'' {
-                    space_idx := -1
-                    for k := len(url) - 2; k >= 0; k -= 1 {
-                        if url[k] == ' ' || url[k] == '\t' {
-                            space_idx = k
-                            break
-                        }
-                    }
-                    if space_idx >= 0 {
-                        after_space := url[space_idx + 1:]
-                        if (after_space[0] == '"' && last == '"') || (after_space[0] == '\'' && last == '\'') {
-                            url_only = url[:space_idx]
-                            title = after_space[1:len(after_space) - 1]
-                        }
-                    }
-                }
-            }
+			// Check for title: [text](url "title") or [text](url 'title')
+			url_only := url
+			title: string
+			if len(url) >= 2 {
+				last := url[len(url) - 1]
+				if last == '"' || last == '\'' {
+					// Find matching opening quote by scanning backward from end-1
+					quote_pos := -1
+					for k := len(url) - 2; k >= 0; k -= 1 {
+						if url[k] == last && (k == 0 || url[k-1] != '\\') {
+							quote_pos = k
+							break
+						}
+					}
+					if quote_pos > 0 && (url[quote_pos - 1] == ' ' || url[quote_pos - 1] == '\t') {
+						url_only = url[:quote_pos - 1]
+						title = url[quote_pos + 1:len(url) - 1]
+					}
+				}
+			}
 
             writer_write(w, "<a href=\"")
             write_url_escaped(url_only, w)
@@ -257,19 +347,22 @@ handle_link :: proc(text: string, i: int, w: ^Writer) -> int {
         }
     }
 
-    // Check for reference-style link [text][ref]
-    if close_bracket + 1 < n && text[close_bracket + 1] == '[' {
-        close_ref := find_byte(text[close_bracket + 2:], ']')
-        if close_ref >= 0 {
-            ref := text[close_bracket + 2 : close_bracket + 2 + close_ref]
-            _ = ref
-            // For simplicity, emit link text without resolving reference
-            writer_write(w, "<a>")
-            convert_inline(text[i + 1:close_bracket], w)
-            writer_write(w, "</a>")
-            return close_bracket + 2 + close_ref + 1
-        }
-    }
+	// Check for reference-style link [text][ref]
+	if close_bracket + 1 < n && text[close_bracket + 1] == '[' {
+		close_ref := find_byte(text[close_bracket + 2:], ']')
+		if close_ref >= 0 {
+			ref := text[close_bracket + 2 : close_bracket + 2 + close_ref]
+			_ = ref
+			// After pre-processing, all resolved refs are converted to inline links.
+			// Any remaining [text][ref] is unresolved — emit literal brackets.
+			writer_write_byte(w, '[')
+			convert_inline(text[i + 1:close_bracket], w)
+			writer_write(w, "][")
+			convert_inline(text[close_bracket + 2:close_bracket + 2 + close_ref], w)
+			writer_write_byte(w, ']')
+			return close_bracket + 2 + close_ref + 1
+		}
+	}
 
     // Not a link — literal bracket
     writer_write_byte(w, '[')
@@ -431,6 +524,64 @@ try_jsx_element :: proc(text: string, w: ^Writer) -> int {
     return 0
 }
 
+// ─── Autolink literals <url> and <email> ──────────────────────────────────
+
+// try_autolink checks if text[i:] starts with a GFM autolink (<url> or <email>).
+// Returns bytes consumed, or 0 if not an autolink.
+try_autolink :: proc(text: string, i: int, w: ^Writer) -> int {
+    if i >= len(text) || text[i] != '<' {
+        return 0
+    }
+    end := find_byte_from(text, '>', i + 1)
+    if end < 0 || end == i + 1 {
+        return 0
+    }
+    url := text[i + 1:end]
+
+    // URI autolink: <scheme:...> where scheme is all letters
+    colon := find_byte(url, ':')
+    if colon > 0 {
+        valid_scheme := true
+        for k in 0 ..< colon {
+            if !is_letter(url[k]) {
+                valid_scheme = false
+                break
+            }
+        }
+        if valid_scheme {
+            writer_write(w, "<a href=\"")
+            write_url_escaped(url, w)
+            writer_write(w, "\">")
+            write_url_escaped(url, w)
+            writer_write(w, "</a>")
+            return end + 1 - i
+        }
+    }
+
+    // Email autolink: <user@domain>
+    at := find_byte(url, '@')
+    if at > 0 && at + 1 < len(url) {
+        valid_email := true
+        for k in 0 ..< len(url) {
+            ch := url[k]
+            if ch == '<' || ch == '>' || ch == ' ' || ch == '\t' || ch == '\n' {
+                valid_email = false
+                break
+            }
+        }
+        if valid_email {
+            writer_write(w, "<a href=\"mailto:")
+            write_url_escaped(url, w)
+            writer_write(w, "\">")
+            write_url_escaped(url, w)
+            writer_write(w, "</a>")
+            return end + 1 - i
+        }
+    }
+
+    return 0
+}
+
 // ─── Closing delimiter search ──────────────────────────────────────────────
 
 // find_closing searches for delimiter in text starting at start.
@@ -504,7 +655,60 @@ find_closing_brace :: proc(text: string, start: int) -> int {
     return -1
 }
 
-// ─── Escaping utilities ───────────────────────────────────────────────────
+// try_html_entity checks if text[i:] starts with an HTML entity (&name; or &#1234; or &#xAB;).
+// Returns the entity string and the new position, or ("", 0) if not an entity.
+try_html_entity :: proc(text: string, i: int) -> (string, int) {
+    if i >= len(text) || text[i] != '&' {
+        return "", 0
+    }
+    j := i + 1
+    if j >= len(text) {
+        return "", 0
+    }
+
+    // Numeric: &#1234; or &#xAB;
+    if text[j] == '#' {
+        j += 1
+        if j < len(text) && (text[j] == 'x' || text[j] == 'X') {
+            j += 1
+            for j < len(text) && is_hex_digit(text[j]) {
+                j += 1
+            }
+        } else {
+            for j < len(text) && is_digit(text[j]) {
+                j += 1
+            }
+        }
+        if j < len(text) && text[j] == ';' {
+            return text[i:j + 1], j + 1
+        }
+        return "", 0
+    }
+
+    // Named: &amp; &lt; &gt; &quot; &nbsp; &copy; etc.
+    // Name must be at least 2 letters
+    name_start := j
+    name_len := 0
+    for j < len(text) && is_letter(text[j]) {
+        j += 1
+        name_len += 1
+    }
+    if name_len >= 2 && j < len(text) && text[j] == ';' {
+        return text[i:j + 1], j + 1
+    }
+
+    return "", 0
+}
+
+// is_emoji_word_char returns true if ch can appear inside an emoji shortcode
+is_emoji_word_char :: proc(ch: byte) -> bool {
+    return is_letter(ch) || is_digit(ch) || ch == '_' || ch == '-'
+}
+
+// is_hex_digit returns true if ch is a hex digit
+is_hex_digit :: proc(ch: byte) -> bool {
+    return is_digit(ch) || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')
+}
 
 // write_escaped writes s to w with HTML entities escaped
 write_escaped :: proc(s: string, w: ^Writer) {

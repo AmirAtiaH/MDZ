@@ -34,6 +34,6 @@ mdz_compile_file :: proc(path: cstring, output: ^cstring, error_msg: ^cstring) -
 @(export)
 mdz_free_string :: proc(s: cstring) {
     if s != nil {
-        free(raw_data(s))
+        free(auto_cast s)
     }
 }

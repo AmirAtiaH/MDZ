@@ -189,6 +189,23 @@ classify_block :: proc(input: string, pos: int) -> BlockType {
         }
     }
 
+    // Comment: {/* ... */} or <!-- ... -->
+    when Comment {
+        if ch == '{' && start + 2 < len(input) && input[start:start + 3] == "{/*" {
+            return .Comment
+        }
+        if ch == '<' && start + 3 < len(input) && input[start:start + 4] == "<!--" {
+            return .Comment
+        }
+    }
+
+    // Definition list: line starting with : or ::
+    when DefList {
+        if ch == ':' && start + 1 < len(input) && input[start + 1] == ' ' {
+            return .DefList
+        }
+    }
+
     // JS block starts
 
     // Import statement
@@ -204,16 +221,59 @@ classify_block :: proc(input: string, pos: int) -> BlockType {
 
     // Export statement
     if start + 6 <= len(input) && input[start:start + 6] == "export" {
-        if start + 6 >= len(input) {
-            return .Export
-        }
-        if input[start + 6] == ' ' {
-            return .Export
-        }
+        if start + 6 >= len(input) { return .Export }
+        if input[start + 6] == ' ' { return .Export }
+    }
+
+    // JS module-level declarations (const, let, var, function, class, async)
+    if input[start] == 'c' && start + 5 <= len(input) && input[start:start + 5] == "const" {
+        if start + 5 == len(input) || input[start + 5] == ' ' { return .JS_Module }
+    }
+    if input[start] == 'l' && start + 3 <= len(input) && input[start:start + 3] == "let" {
+        if start + 3 == len(input) || input[start + 3] == ' ' { return .JS_Module }
+    }
+    if input[start] == 'v' && start + 3 <= len(input) && input[start:start + 3] == "var" {
+        if start + 3 == len(input) || input[start + 3] == ' ' { return .JS_Module }
+    }
+    if start + 8 <= len(input) && input[start:start + 8] == "function" {
+        if start + 8 == len(input) || input[start + 8] == ' ' { return .JS_Module }
+    }
+    if start + 5 <= len(input) && input[start:start + 5] == "class" {
+        if start + 5 == len(input) || input[start + 5] == ' ' { return .JS_Module }
+    }
+    if start + 5 <= len(input) && input[start:start + 5] == "async" {
+        if start + 5 == len(input) || input[start + 5] == ' ' { return .JS_Module }
     }
 
     // JSX element at block level (< followed by identifier)
     if ch == '<' {
+        when Autolink {
+            // Check if this looks like a GFM autolink rather than a JSX element.
+            // URI autolinks: <scheme://...> — scan for ://
+            // Email autolinks: <user@domain> — scan for @
+            is_autolink := false
+            scan := start + 1
+            for scan < len(input) && input[scan] != '\n' && input[scan] != ' ' && input[scan] != '\t' && input[scan] != '>' {
+                if input[scan] == ':' && scan + 2 < len(input) && input[scan + 1] == '/' && input[scan + 2] == '/' {
+                    is_autolink = true
+                    break
+                }
+                scan += 1
+            }
+            if !is_autolink {
+                scan = start + 1
+                for scan < len(input) && input[scan] != '\n' && input[scan] != ' ' && input[scan] != '\t' && input[scan] != '>' {
+                    if input[scan] == '@' && scan > start + 1 {
+                        is_autolink = true
+                        break
+                    }
+                    scan += 1
+                }
+            }
+            if is_autolink {
+                return .Paragraph
+            }
+        }
         return .JSX_Element
     }
 
@@ -223,17 +283,56 @@ classify_block :: proc(input: string, pos: int) -> BlockType {
     }
 
     // GFM table: current line has `|` and next line is a separator
-    if has_pipe_in_line(input, start) {
-        if !is_table_separator_line(input, start) {
-            next_line := find_next_line(input, start)
-            if next_line >= 0 && is_table_separator_line(input, next_line) {
-                return .Table
+    when Tables {
+        if has_pipe_in_line(input, start) {
+            if !is_table_separator_line(input, start) {
+                next_line := find_next_line(input, start)
+                if next_line >= 0 && is_table_separator_line(input, next_line) {
+                    return .Table
+                }
             }
         }
     }
 
     // Default: paragraph
     return .Paragraph
+}
+
+// skip_fence advances past a code fence without emitting output.
+// Returns the new position (past the closing fence).
+skip_fence :: proc(input: string, pos: int) -> int {
+    i := pos
+    marker := input[i]
+    fence_len := count_leading(input[i:], marker)
+    i += fence_len
+
+    // Skip language tag line
+    for i < len(input) && input[i] != '\n' { i += 1 }
+    if i < len(input) && input[i] == '\n' { i += 1 }
+
+    // Find closing fence
+    for i < len(input) {
+        if input[i] == marker && count_leading(input[i:], marker) >= fence_len {
+            rest := i + count_leading(input[i:], marker)
+            is_closing := true
+            for rest < len(input) && input[rest] != '\n' {
+                if input[rest] != ' ' && input[rest] != '\t' {
+                    is_closing = false
+                    break
+                }
+                rest += 1
+            }
+            if is_closing {
+                i += fence_len
+                for i < len(input) && input[i] != '\n' { i += 1 }
+                if i < len(input) && input[i] == '\n' { i += 1 }
+                return i
+            }
+        }
+        for i < len(input) && input[i] != '\n' { i += 1 }
+        if i < len(input) { i += 1 }
+    }
+    return i
 }
 
 // ─── JS block boundary detection ────────────────────────────────────────────
@@ -245,9 +344,10 @@ classify_block :: proc(input: string, pos: int) -> BlockType {
 find_js_block_end :: proc(input: string, start: int) -> int {
     depth := 0       // {} depth
     parens := 0      // () depth
+    jsx_depth := 0   // <> JSX tag depth
     in_string := false
     string_char: byte = 0
-    in_tmpl := false // template literal depth (backtick)
+    newline_count := 0 // safety limit for unterminated blocks
 
     i := start
     for i < len(input) {
@@ -255,28 +355,11 @@ find_js_block_end :: proc(input: string, start: int) -> int {
 
         if in_string {
             if ch == '\\' {
-                i += 2 // skip escaped char
+                i += 2
                 continue
             }
             if ch == string_char {
                 in_string = false
-            }
-            i += 1
-            continue
-        }
-
-        if in_tmpl {
-            if ch == '\\' {
-                i += 2
-                continue
-            }
-            if ch == '`' {
-                in_tmpl = false
-            }
-            if ch == '$' && i + 1 < len(input) && input[i + 1] == '{' {
-                depth += 1
-                i += 2
-                continue
             }
             i += 1
             continue
@@ -290,7 +373,35 @@ find_js_block_end :: proc(input: string, start: int) -> int {
             in_string = true
             string_char = '"'
         case '`':
-            in_tmpl = true
+            // Skip entire template literal in one scan, handling
+            // ${} expressions and nested template literals.
+            i += 1
+            for i < len(input) {
+                if input[i] == '`' {
+                    i += 1
+                    break
+                }
+                if input[i] == '\\' { i += 2; continue }
+                if input[i] == '$' && i + 1 < len(input) && input[i + 1] == '{' {
+                    i += 2
+                    expr_depth := 1
+                    for i < len(input) && expr_depth > 0 {
+                        if input[i] == '{' { expr_depth += 1 }
+                        if input[i] == '}' { expr_depth -= 1 }
+                        if input[i] == '\\' { i += 1 }
+                        if input[i] == '`' {
+                            i += 1
+                            for i < len(input) && input[i] != '`' {
+                                if input[i] == '\\' { i += 1 }
+                                i += 1
+                            }
+                        }
+                        if expr_depth > 0 { i += 1 }
+                    }
+                }
+                i += 1
+            }
+            continue
         case '{':
             depth += 1
         case '}':
@@ -303,22 +414,89 @@ find_js_block_end :: proc(input: string, start: int) -> int {
             if parens > 0 {
                 parens -= 1
             }
+        case '<':
+            // JSX tag tracking: only at depth 0 (not inside {} expressions)
+            if depth == 0 && i + 1 < len(input) {
+                if input[i + 1] == '/' && i + 2 < len(input) && is_jsx_identifier_start(input[i + 2]) {
+                    if jsx_depth > 0 {
+                        jsx_depth -= 1
+                    }
+                } else if is_jsx_identifier_start(input[i + 1]) {
+                    // Check for self-closing: <Tag/> — scan for />
+                    tag_start := i + 1
+                    // Skip tag name
+                    scan := tag_start
+                    for scan < len(input) && is_jsx_identifier_continue(input[scan]) {
+                        scan += 1
+                    }
+                    tag_name_end := scan
+                    // Skip attributes (handling strings and braces)
+                    for scan < len(input) && input[scan] != '>' {
+                        if input[scan] == '{' {
+                            // Skip attribute expression
+                            expr_depth := 1
+                            scan += 1
+                            for scan < len(input) && expr_depth > 0 {
+                                if input[scan] == '{' {
+                                    expr_depth += 1
+                                } else if input[scan] == '}' {
+                                    expr_depth -= 1
+                                } else if input[scan] == '\'' || input[scan] == '"' {
+                                    quote := input[scan]
+                                    scan += 1
+                                    for scan < len(input) && input[scan] != quote {
+                                        if input[scan] == '\\' {
+                                            scan += 1
+                                        }
+                                        scan += 1
+                                    }
+                                }
+                                if expr_depth > 0 {
+                                    scan += 1
+                                }
+                            }
+                        } else if input[scan] == '\'' || input[scan] == '"' {
+                            quote := input[scan]
+                            scan += 1
+                            for scan < len(input) && input[scan] != quote {
+                                if input[scan] == '\\' {
+                                    scan += 1
+                                }
+                                scan += 1
+                            }
+                        }
+                        scan += 1
+                    }
+                    // Check if self-closing: last char before > is /
+                    is_self_closing := false
+                    if scan > tag_start && scan < len(input) && input[scan - 1] == '/' {
+                        is_self_closing = true
+                    } else if tag_name_end > tag_start {
+                        // Check for HTML void elements that don't require closing tags
+                        tag_name := input[tag_start:tag_name_end]
+                        if is_html_void_element(tag_name) {
+                            is_self_closing = true
+                        }
+                    }
+                    if !is_self_closing {
+                        jsx_depth += 1
+                    }
+                }
+            }
         case '\n':
+            newline_count += 1
+            // Safety: if we've seen too many newlines without closing depth,
+            // assume unterminated expression and bail out.
+            if newline_count > 100 && depth > 0 {
+                return i
+            }
             // At depth 0, check if the next line switches to markdown
-            if depth == 0 && parens == 0 {
+            if depth == 0 && parens == 0 && jsx_depth == 0 {
                 j := i + 1
                 // Skip whitespace-only lines
-                blank_count := 0
                 for j < len(input) {
                     cj := input[j]
-                    if cj == ' ' || cj == '\t' {
-                        j += 1
-                    } else if cj == '\n' {
-                        blank_count += 1
-                        if blank_count >= 2 {
-                            // Two consecutive blank lines — strong signal
-                            return j
-                        }
+                    if cj == ' ' || cj == '\t' || cj == '\n' {
                         j += 1
                     } else {
                         break
@@ -327,47 +505,13 @@ find_js_block_end :: proc(input: string, start: int) -> int {
                 if j >= len(input) {
                     return i
                 }
-                // Check if next non-blank, non-whitespace line starts markdown
-                nj := j
-                for nj < len(input) && (input[nj] == ' ' || input[nj] == '\t') {
-                    nj += 1
-                }
-                if nj < len(input) {
-                    nc := input[nj]
-                    switch nc {
-                    case '#', '>', '`', '~':
-                        if nc == '`' || nc == '~' {
-                            if count_leading(input[nj:], nc) >= 3 {
-                                return nj
-                            }
-                            // Single backtick is not a block start, continue
-                        } else {
-                            return nj
-                        }
-                    case '-', '*', '_':
-                        if count_leading(input[nj:], nc) >= 3 {
-                            // Could be <hr>
-                            rest := nj + count_leading(input[nj:], nc)
-                            is_hr := true
-                            for rest < len(input) && input[rest] != '\n' {
-                                if input[rest] != ' ' && input[rest] != '\t' {
-                                    is_hr = false
-                                    break
-                                }
-                                rest += 1
-                            }
-                            if is_hr {
-                                return nj
-                            }
-                        }
-                        // List marker
-                        if (nc == '-' || nc == '*') && nj + 1 < len(input) && input[nj + 1] == ' ' {
-                            return nj
-                        }
-                        // Continue JS block since single dash/star is ambiguous
-                    case:
-                        // Not markdown — continue JS block
-                    }
+                // Check if next non-whitespace line starts markdown.
+                // Continue JS block only for continuation markers: . , ) ] } = | & { [
+                nc := input[j]
+                if nc == '.' || nc == ',' || nc == ')' || nc == ']' || nc == '}' || nc == '=' || nc == '|' || nc == '&' || nc == '{' || nc == '[' {
+                    // JS continuation — stay in JS block
+                } else {
+                    return j
                 }
             }
         }
@@ -375,6 +519,18 @@ find_js_block_end :: proc(input: string, start: int) -> int {
     }
 
     return i
+}
+
+// is_html_void_element returns true for HTML elements that cannot have children
+// and thus don't require a closing tag. Per the HTML spec: area, base, br, col,
+// embed, hr, img, input, link, meta, param, source, track, wbr.
+is_html_void_element :: proc(name: string) -> bool {
+    switch name {
+    case "area", "base", "br", "col", "embed", "hr", "img", "input",
+         "link", "meta", "param", "source", "track", "wbr":
+        return true
+    }
+    return false
 }
 
 // ─── Table detection helpers ────────────────────────────────────────────────
@@ -401,6 +557,28 @@ find_next_line :: proc(input: string, pos: int) -> int {
         return i + 1
     }
     return -1
+}
+
+// is_deflist_next checks if the next immediate line starts a definition.
+// Only returns true when the following line (non-blank) starts with : — a blank
+// line between term and definition means they are separate blocks.
+is_deflist_next :: proc(input: string, pos: int) -> bool {
+    i := pos
+    for i < len(input) && input[i] != '\n' { i += 1 }
+    if i < len(input) && input[i] == '\n' { i += 1 }
+    if i >= len(input) { return false }
+    // Check the next line is not blank
+    next_start := i
+    j := next_start
+    for j < len(input) && (input[j] == ' ' || input[j] == '\t') { j += 1 }
+    if j >= len(input) || input[j] == '\n' { return false } // blank line
+    if input[j] == ':' {
+        k := j + 1
+        if k < len(input) && (input[k] == ' ' || input[k] == '\t') {
+            return true
+        }
+    }
+    return false
 }
 
 // is_table_separator_line checks if the line at pos is a GFM table separator

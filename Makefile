@@ -7,13 +7,13 @@ build:
 	$(ODIN) build .
 
 build-fast:
-	$(ODIN) build . -o:speed -microarch:native -no-bounds-check -disable-assert -lto:thin
+	$(ODIN) build . -o:aggressive -microarch:native -no-bounds-check -disable-assert -lto:thin
 
 test:
 	$(ODIN) test .
 
 ffi:
-	$(ODIN) build ffi -build:shared -o:speed -no-bounds-check -disable-assert
+	$(ODIN) build ffi -build-mode:shared -o:aggressive -no-bounds-check -disable-assert
 
 c-example: ffi
 	cd c && $(MAKE)

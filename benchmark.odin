@@ -323,6 +323,6 @@ run_benchmarks :: proc() {
     fmt.println("   P99 is the cost when something predictable is wrong.")
     fmt.println("   That's what your users feel every day.'")
     fmt.println()
-    fmt.println("Build config: -o:speed -lto:thin -microarch:native -no-bounds-check -disable-assert")
+	fmt.println("Build config: -o:aggressive -lto:thin -microarch:native -no-bounds-check -disable-assert")
     fmt.println()
 }

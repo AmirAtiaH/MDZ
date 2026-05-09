@@ -10,5 +10,5 @@ case "$(uname -s)" in
 esac
 
 echo "==> Building mdz (fast)..."
-$ODIN build . -o:speed -microarch:native -no-bounds-check -disable-assert -lto:thin
+$ODIN build . -o:aggressive -microarch:native -no-bounds-check -disable-assert -lto:thin
 echo "Done: ./mdz"
